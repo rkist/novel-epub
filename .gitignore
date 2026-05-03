@@ -1,6 +1,4 @@
 venv/
-chapters/
-translated/
 checkpoint.json
 *.epub
 __pycache__/
