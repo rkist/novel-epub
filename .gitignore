@@ -1,4 +1,2 @@
 venv/
-checkpoint.json
-*.epub
 __pycache__/

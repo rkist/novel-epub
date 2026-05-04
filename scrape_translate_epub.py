@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Scrape "The Legendary Mechanic" from novelhi.com,
-translate to pt-BR using Google Translate (free), and build an EPUB.
+Scrape a novel from novelhi.com, translate to a target language, and build an EPUB.
 
 Usage:
-    python scrape_translate_epub.py [--start CHAPTER] [--end CHAPTER] [--delay SECONDS]
+    python scrape_translate_epub.py \\
+        --url https://novelhi.com/novel/fantasy/the-legendary-mechanic \\
+        --novel the-legendary-mechanic \\
+        --title "O Mecânico Lendário" \\
+        --author "Qi Peijia" \\
+        --end 1490
 
-Resumes from checkpoint automatically if interrupted.
+Data is stored under novels/<novel>/. Safe to interrupt and resume.
 """
 
 import argparse
 import json
 import os
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -22,12 +25,6 @@ from bs4 import BeautifulSoup
 from deep_translator import GoogleTranslator
 from ebooklib import epub
 
-BASE_URL = "https://novelhi.com/novel/fantasy/the-legendary-mechanic"
-CHECKPOINT_FILE = "checkpoint.json"
-CHAPTERS_DIR = "chapters"
-TRANSLATED_DIR = "translated"
-OUTPUT_EPUB = "o-mecanico-lendario.epub"
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -35,23 +32,44 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9,pt-BR;q=0.8",
 }
 
-MAX_TRANSLATE_CHARS = 4500  # Google Translate free limit ~5000, leave margin
+MAX_TRANSLATE_CHARS = 4500
 
 
-def load_checkpoint():
-    if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE) as f:
-            return json.load(f)
+# --- Path helpers ---
+
+def novel_dir(slug: str) -> Path:
+    return Path("novels") / slug
+
+def chapters_dir(slug: str) -> Path:
+    return novel_dir(slug) / "chapters"
+
+def translated_dir(slug: str) -> Path:
+    return novel_dir(slug) / "translated"
+
+def checkpoint_file(slug: str) -> Path:
+    return novel_dir(slug) / "checkpoint.json"
+
+def output_epub(slug: str, title: str) -> Path:
+    safe_title = re.sub(r"[^\w\s-]", "", title).strip().replace(" ", "-").lower()
+    return novel_dir(slug) / f"{safe_title}.epub"
+
+
+# --- Checkpoint ---
+
+def load_checkpoint(slug: str) -> dict:
+    path = checkpoint_file(slug)
+    if path.exists():
+        return json.loads(path.read_text())
     return {"last_scraped": 0, "last_translated": 0}
 
-
-def save_checkpoint(data):
-    with open(CHECKPOINT_FILE, "w") as f:
-        json.dump(data, f)
+def save_checkpoint(slug: str, data: dict):
+    checkpoint_file(slug).write_text(json.dumps(data))
 
 
-def scrape_chapter(chapter_num: int, session: requests.Session, max_retries: int = 3) -> dict | None:
-    url = f"{BASE_URL}/{chapter_num}"
+# --- Scraping ---
+
+def scrape_chapter(chapter_num: int, base_url: str, session: requests.Session, max_retries: int = 3) -> dict | None:
+    url = f"{base_url}/{chapter_num}"
     for attempt in range(max_retries):
         try:
             resp = session.get(url, headers=HEADERS, timeout=30)
@@ -96,17 +114,14 @@ def scrape_chapter(chapter_num: int, session: requests.Session, max_retries: int
             paragraphs.append(" ".join(current_para))
         text = "\n\n".join(paragraphs)
 
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return {"chapter_num": chapter_num, "title": title, "text": re.sub(r"\n{3,}", "\n\n", text).strip()}
 
-    return {"chapter_num": chapter_num, "title": title, "text": text}
 
+# --- Translation ---
 
 def translate_text(text: str, translator: GoogleTranslator) -> str:
     if not text.strip():
         return text
-
-    paragraphs = text.split("\n\n")
-    translated_paragraphs = []
 
     def _translate_chunk(chunk: str) -> str:
         for attempt in range(3):
@@ -122,13 +137,13 @@ def translate_text(text: str, translator: GoogleTranslator) -> str:
             return chunk
         return chunk
 
-    for para in paragraphs:
+    translated_paragraphs = []
+    for para in text.split("\n\n"):
         if len(para) <= MAX_TRANSLATE_CHARS:
             translated_paragraphs.append(_translate_chunk(para))
         else:
             sentences = re.split(r"(?<=[.!?])\s+", para)
-            chunks = []
-            current_chunk = ""
+            chunks, current_chunk = [], ""
             for sentence in sentences:
                 if len(current_chunk) + len(sentence) + 1 > MAX_TRANSLATE_CHARS:
                     if current_chunk:
@@ -138,9 +153,7 @@ def translate_text(text: str, translator: GoogleTranslator) -> str:
                     current_chunk = f"{current_chunk} {sentence}".strip()
             if current_chunk:
                 chunks.append(current_chunk)
-
-            translated_chunks = [_translate_chunk(c) for c in chunks]
-            translated_paragraphs.append(" ".join(translated_chunks))
+            translated_paragraphs.append(" ".join(_translate_chunk(c) for c in chunks))
 
     return "\n\n".join(translated_paragraphs)
 
@@ -153,14 +166,15 @@ def translate_title(title: str, translator: GoogleTranslator) -> str:
         return title
 
 
+# --- Progress display ---
+
 def format_eta(seconds: float) -> str:
     if seconds < 60:
         return f"{int(seconds)}s"
     elif seconds < 3600:
         return f"{int(seconds // 60)}m {int(seconds % 60)}s"
     else:
-        h = int(seconds // 3600)
-        m = int((seconds % 3600) // 60)
+        h, m = int(seconds // 3600), int((seconds % 3600) // 60)
         return f"{h}h {m}m"
 
 
@@ -170,17 +184,16 @@ def progress_line(current: int, total: int, start_time: float, label: str) -> st
         return f"[{label}] {current}/{total}"
     elapsed = time.time() - start_time
     avg = elapsed / done
-    remaining = avg * (total - current + 1)
     pct = (done / total) * 100
-    bar_width = 20
-    filled = int(bar_width * done / total)
-    bar = "█" * filled + "░" * (bar_width - filled)
-    return f"[{bar}] {pct:5.1f}% | {current}/{total} | ETA {format_eta(remaining)} | {avg:.1f}s/ch"
+    bar = "█" * int(20 * done / total) + "░" * (20 - int(20 * done / total))
+    return f"[{bar}] {pct:5.1f}% | {current}/{total} | ETA {format_eta(avg * (total - current + 1))} | {avg:.1f}s/ch"
 
 
-def scrape_all(start: int, end: int, delay: float):
-    os.makedirs(CHAPTERS_DIR, exist_ok=True)
-    checkpoint = load_checkpoint()
+# --- Pipeline steps ---
+
+def scrape_all(slug: str, base_url: str, start: int, end: int, delay: float):
+    chapters_dir(slug).mkdir(parents=True, exist_ok=True)
+    checkpoint = load_checkpoint(slug)
     resume_from = max(checkpoint["last_scraped"] + 1, start)
     total = end - start + 1
 
@@ -193,16 +206,16 @@ def scrape_all(start: int, end: int, delay: float):
     done_count = 0
 
     for ch in range(resume_from, end + 1):
-        chapter_file = os.path.join(CHAPTERS_DIR, f"{ch:04d}.json")
-        if os.path.exists(chapter_file):
+        chapter_file = chapters_dir(slug) / f"{ch:04d}.json"
+        if chapter_file.exists():
             checkpoint["last_scraped"] = ch
-            save_checkpoint(checkpoint)
+            save_checkpoint(slug, checkpoint)
             done_count += 1
             continue
 
         done_count += 1
         print(f"\r{progress_line(done_count, total, step_start, 'Scraping')} | ch.{ch}...", end="", flush=True)
-        data = scrape_chapter(ch, session)
+        data = scrape_chapter(ch, base_url, session)
 
         if data is None:
             consecutive_failures += 1
@@ -214,243 +227,222 @@ def scrape_all(start: int, end: int, delay: float):
             continue
 
         consecutive_failures = 0
-        with open(chapter_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
+        chapter_file.write_text(json.dumps(data, ensure_ascii=False, indent=2))
         checkpoint["last_scraped"] = ch
-        save_checkpoint(checkpoint)
-        word_count = len(data["text"].split())
-        print(f"\r{progress_line(done_count, total, step_start, 'Scraping')} | ch.{ch} OK ({word_count}w)")
+        save_checkpoint(slug, checkpoint)
+        print(f"\r{progress_line(done_count, total, step_start, 'Scraping')} | ch.{ch} OK ({len(data['text'].split())}w)")
         time.sleep(delay)
 
-    elapsed = time.time() - step_start
-    print(f"\nScraping complete. Last chapter: {checkpoint['last_scraped']} ({format_eta(elapsed)} elapsed)")
+    print(f"\nScraping complete. Last chapter: {checkpoint['last_scraped']} ({format_eta(time.time() - step_start)} elapsed)")
 
 
-def translate_all(start: int, end: int, delay: float):
-    os.makedirs(TRANSLATED_DIR, exist_ok=True)
-    checkpoint = load_checkpoint()
+def translate_all(slug: str, start: int, end: int, delay: float, source_lang: str, target_lang: str):
+    translated_dir(slug).mkdir(parents=True, exist_ok=True)
+    checkpoint = load_checkpoint(slug)
     resume_from = max(checkpoint["last_translated"] + 1, start)
     total = end - start + 1
 
     if resume_from > start:
         print(f"Resuming translation from chapter {resume_from}")
 
-    translator = GoogleTranslator(source="en", target="pt")
+    translator = GoogleTranslator(source=source_lang, target=target_lang)
     step_start = time.time()
     done_count = 0
 
     for ch in range(resume_from, end + 1):
-        source_file = os.path.join(CHAPTERS_DIR, f"{ch:04d}.json")
-        translated_file = os.path.join(TRANSLATED_DIR, f"{ch:04d}.json")
+        source_file = chapters_dir(slug) / f"{ch:04d}.json"
+        dest_file = translated_dir(slug) / f"{ch:04d}.json"
 
-        if os.path.exists(translated_file):
+        if dest_file.exists():
             checkpoint["last_translated"] = ch
-            save_checkpoint(checkpoint)
+            save_checkpoint(slug, checkpoint)
             done_count += 1
-            continue
-
-        if not os.path.exists(source_file):
-            done_count += 1
-            print(f"\r{progress_line(done_count, total, step_start, 'Translating')} | ch.{ch} SKIPPED (not scraped)")
             continue
 
         done_count += 1
-        with open(source_file, encoding="utf-8") as f:
-            data = json.load(f)
 
+        if not source_file.exists():
+            print(f"\r{progress_line(done_count, total, step_start, 'Translating')} | ch.{ch} SKIPPED (not scraped)")
+            continue
+
+        data = json.loads(source_file.read_text())
         print(f"\r{progress_line(done_count, total, step_start, 'Translating')} | ch.{ch}...", end="", flush=True)
-
-        translated_title = translate_title(data["title"], translator)
-        translated_text = translate_text(data["text"], translator)
 
         translated_data = {
             "chapter_num": data["chapter_num"],
             "title_original": data["title"],
-            "title": translated_title,
-            "text": translated_text,
+            "title": translate_title(data["title"], translator),
+            "text": translate_text(data["text"], translator),
         }
 
-        with open(translated_file, "w", encoding="utf-8") as f:
-            json.dump(translated_data, f, ensure_ascii=False, indent=2)
-
+        dest_file.write_text(json.dumps(translated_data, ensure_ascii=False, indent=2))
         checkpoint["last_translated"] = ch
-        save_checkpoint(checkpoint)
+        save_checkpoint(slug, checkpoint)
         print(f"\r{progress_line(done_count, total, step_start, 'Translating')} | ch.{ch} OK")
         time.sleep(delay)
 
-    elapsed = time.time() - step_start
-    print(f"\nTranslation complete. Last chapter: {checkpoint['last_translated']} ({format_eta(elapsed)} elapsed)")
+    print(f"\nTranslation complete. Last chapter: {checkpoint['last_translated']} ({format_eta(time.time() - step_start)} elapsed)")
 
 
-def build_epub(start: int, end: int):
+def build_epub(slug: str, start: int, end: int, title: str, author: str, target_lang: str):
     book = epub.EpubBook()
-    book.set_identifier("the-legendary-mechanic-ptbr")
-    book.set_title("O Mecânico Lendário")
-    book.set_language("pt-BR")
-    book.add_author("Qi Peijia (齐佩甲)")
+    book.set_identifier(f"{slug}-{target_lang}")
+    book.set_title(title)
+    book.set_language(target_lang)
+    book.add_author(author)
 
-    style = """
-    body { font-family: Georgia, serif; line-height: 1.6; margin: 1em; }
-    h1 { font-size: 1.4em; margin-bottom: 0.5em; }
-    p { text-indent: 1.5em; margin: 0.3em 0; }
-    """
     css = epub.EpubItem(
-        uid="style", file_name="style/default.css",
-        media_type="text/css", content=style.encode("utf-8"),
+        uid="style", file_name="style/default.css", media_type="text/css",
+        content=b"body{font-family:Georgia,serif;line-height:1.6;margin:1em}"
+                b"h1{font-size:1.4em;margin-bottom:.5em}"
+                b"p{text-indent:1.5em;margin:.3em 0}",
     )
     book.add_item(css)
 
-    chapters = []
-    spine = ["nav"]
-    toc = []
+    chapters_list, spine, toc = [], ["nav"], []
 
     for ch in range(start, end + 1):
-        translated_file = os.path.join(TRANSLATED_DIR, f"{ch:04d}.json")
-        if not os.path.exists(translated_file):
+        dest_file = translated_dir(slug) / f"{ch:04d}.json"
+        if not dest_file.exists():
             continue
 
-        with open(translated_file, encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(dest_file.read_text())
+        paragraphs_html = "".join(f"<p>{p.strip()}</p>" for p in data["text"].split("\n\n") if p.strip())
+        chapter_title = f"Capítulo {ch} — {data['title']}"
 
-        paragraphs_html = "".join(
-            f"<p>{p.strip()}</p>" for p in data["text"].split("\n\n") if p.strip()
+        content = (
+            f"<?xml version='1.0' encoding='utf-8'?>"
+            f"<html xmlns='http://www.w3.org/1999/xhtml'>"
+            f"<head><title>{chapter_title}</title>"
+            f"<link rel='stylesheet' type='text/css' href='../style/default.css'/></head>"
+            f"<body><h1>{chapter_title}</h1>{paragraphs_html}</body></html>"
         )
 
-        chapter_content = f"""<?xml version='1.0' encoding='utf-8'?>
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head><title>{data['title']}</title>
-<link rel="stylesheet" type="text/css" href="../style/default.css"/></head>
-<body>
-<h1>Capítulo {ch} — {data['title']}</h1>
-{paragraphs_html}
-</body></html>"""
+        epub_ch = epub.EpubHtml(title=chapter_title, file_name=f"chapter_{ch:04d}.xhtml", lang=target_lang)
+        epub_ch.set_content(content.encode("utf-8"))
+        book.add_item(epub_ch)
+        chapters_list.append(epub_ch)
+        spine.append(epub_ch)
+        toc.append(epub.Link(f"chapter_{ch:04d}.xhtml", chapter_title, f"ch{ch}"))
 
-        epub_chapter = epub.EpubHtml(
-            title=f"Capítulo {ch} — {data['title']}",
-            file_name=f"chapter_{ch:04d}.xhtml",
-            lang="pt-BR",
-        )
-        epub_chapter.set_content(chapter_content.encode("utf-8"))
-        book.add_item(epub_chapter)
-        chapters.append(epub_chapter)
-        spine.append(epub_chapter)
-        toc.append(epub.Link(f"chapter_{ch:04d}.xhtml", f"Cap. {ch} — {data['title']}", f"ch{ch}"))
-
-    book.toc = toc
+    book.toc, book.spine = toc, spine
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
-    book.spine = spine
 
-    epub.write_epub(OUTPUT_EPUB, book, {})
-    print(f"\nEPUB created: {OUTPUT_EPUB} ({len(chapters)} chapters)")
+    out = output_epub(slug, title)
+    epub.write_epub(str(out), book, {})
+    print(f"\nEPUB created: {out} ({len(chapters_list)} chapters)")
 
 
-def find_gaps(start: int, end: int):
-    missing_scraped = []
-    missing_translated = []
+def find_gaps(slug: str, start: int, end: int):
+    missing_scraped, missing_translated = [], []
     for ch in range(start, end + 1):
-        if not os.path.exists(os.path.join(CHAPTERS_DIR, f"{ch:04d}.json")):
+        if not (chapters_dir(slug) / f"{ch:04d}.json").exists():
             missing_scraped.append(ch)
-        elif not os.path.exists(os.path.join(TRANSLATED_DIR, f"{ch:04d}.json")):
+        elif not (translated_dir(slug) / f"{ch:04d}.json").exists():
             missing_translated.append(ch)
     return missing_scraped, missing_translated
 
 
-def retry_gaps(start: int, end: int, delay: float):
-    missing_scraped, missing_translated = find_gaps(start, end)
+def retry_gaps(slug: str, base_url: str, start: int, end: int, delay: float, source_lang: str, target_lang: str):
+    missing_scraped, missing_translated = find_gaps(slug, start, end)
 
     if not missing_scraped and not missing_translated:
         print("No gaps found! All chapters scraped and translated.")
         return
 
     if missing_scraped:
-        print(f"Found {len(missing_scraped)} chapters not scraped: {missing_scraped[:10]}{'...' if len(missing_scraped) > 10 else ''}")
+        preview = missing_scraped[:10]
+        suffix = "..." if len(missing_scraped) > 10 else ""
+        print(f"Found {len(missing_scraped)} chapters not scraped: {preview}{suffix}")
         session = requests.Session()
         for i, ch in enumerate(missing_scraped):
             print(f"  Retrying scrape {i+1}/{len(missing_scraped)} — ch.{ch}...", end=" ", flush=True)
-            data = scrape_chapter(ch, session)
+            data = scrape_chapter(ch, base_url, session)
             if data:
-                with open(os.path.join(CHAPTERS_DIR, f"{ch:04d}.json"), "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                (chapters_dir(slug) / f"{ch:04d}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2))
                 print("OK")
             else:
                 print("FAILED")
             time.sleep(delay)
 
-    missing_scraped, missing_translated = find_gaps(start, end)
+    missing_scraped, missing_translated = find_gaps(slug, start, end)
 
     if missing_translated:
-        print(f"Found {len(missing_translated)} chapters not translated: {missing_translated[:10]}{'...' if len(missing_translated) > 10 else ''}")
-        translator = GoogleTranslator(source="en", target="pt")
+        preview = missing_translated[:10]
+        suffix = "..." if len(missing_translated) > 10 else ""
+        print(f"Found {len(missing_translated)} chapters not translated: {preview}{suffix}")
+        translator = GoogleTranslator(source=source_lang, target=target_lang)
         for i, ch in enumerate(missing_translated):
-            source_file = os.path.join(CHAPTERS_DIR, f"{ch:04d}.json")
-            if not os.path.exists(source_file):
+            src = chapters_dir(slug) / f"{ch:04d}.json"
+            if not src.exists():
                 continue
-            with open(source_file, encoding="utf-8") as f:
-                data = json.load(f)
+            data = json.loads(src.read_text())
             print(f"  Retrying translate {i+1}/{len(missing_translated)} — ch.{ch}...", end=" ", flush=True)
-            translated_title = translate_title(data["title"], translator)
-            translated_text = translate_text(data["text"], translator)
             translated_data = {
                 "chapter_num": data["chapter_num"],
                 "title_original": data["title"],
-                "title": translated_title,
-                "text": translated_text,
+                "title": translate_title(data["title"], translator),
+                "text": translate_text(data["text"], translator),
             }
-            with open(os.path.join(TRANSLATED_DIR, f"{ch:04d}.json"), "w", encoding="utf-8") as f:
-                json.dump(translated_data, f, ensure_ascii=False, indent=2)
+            (translated_dir(slug) / f"{ch:04d}.json").write_text(json.dumps(translated_data, ensure_ascii=False, indent=2))
             print("OK")
             time.sleep(delay)
 
-    missing_scraped, missing_translated = find_gaps(start, end)
+    missing_scraped, missing_translated = find_gaps(slug, start, end)
     total_missing = len(missing_scraped) + len(missing_translated)
-    if total_missing:
-        print(f"\nStill {total_missing} gaps remaining after retry.")
-    else:
-        print("\nAll gaps filled!")
+    print(f"\nStill {total_missing} gaps remaining." if total_missing else "\nAll gaps filled!")
 
+
+# --- CLI ---
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape, translate, and build EPUB")
-    parser.add_argument("--start", type=int, default=1, help="First chapter (default: 1)")
-    parser.add_argument("--end", type=int, default=1490, help="Last chapter (default: 1490)")
-    parser.add_argument("--delay", type=float, default=2.0, help="Delay between requests in seconds (default: 2)")
-    parser.add_argument("--step", choices=["scrape", "translate", "epub", "retry", "status", "all"], default="all",
-                        help="Run a specific step (default: all)")
+    parser = argparse.ArgumentParser(
+        description="Scrape a novelhi.com novel, translate it, and export to EPUB.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--url",         required=True,  help="Base novel URL, e.g. https://novelhi.com/novel/fantasy/the-legendary-mechanic")
+    parser.add_argument("--novel",       required=True,  help="Novel slug used as folder name, e.g. the-legendary-mechanic")
+    parser.add_argument("--title",       required=True,  help="EPUB title in target language, e.g. 'O Mecânico Lendário'")
+    parser.add_argument("--author",      default="Unknown", help="Author name for the EPUB")
+    parser.add_argument("--start",       type=int, default=1,    help="First chapter number")
+    parser.add_argument("--end",         type=int, required=True, help="Last chapter number")
+    parser.add_argument("--delay",       type=float, default=2.0, help="Seconds between requests")
+    parser.add_argument("--source-lang", default="en",  help="Source language code for translation")
+    parser.add_argument("--target-lang", default="pt",  help="Target language code for translation")
+    parser.add_argument("--step", choices=["scrape", "translate", "epub", "retry", "status", "all"],
+                        default="all", help="Which step to run")
     args = parser.parse_args()
 
-    print(f"=== The Legendary Mechanic → O Mecânico Lendário ===")
-    print(f"Chapters {args.start}-{args.end}, delay {args.delay}s\n")
+    print(f"=== {args.title} ===")
+    print(f"Novel: {args.novel} | Chapters {args.start}-{args.end} | {args.source_lang} → {args.target_lang} | delay {args.delay}s\n")
 
     if args.step == "status":
-        missing_scraped, missing_translated = find_gaps(args.start, args.end)
+        missing_scraped, missing_translated = find_gaps(args.novel, args.start, args.end)
         total = args.end - args.start + 1
-        scraped = total - len(missing_scraped)
-        translated = total - len(missing_scraped) - len(missing_translated)
-        print(f"Scraped:    {scraped}/{total}")
-        print(f"Translated: {translated}/{total}")
+        print(f"Scraped:    {total - len(missing_scraped)}/{total}")
+        print(f"Translated: {total - len(missing_scraped) - len(missing_translated)}/{total}")
         if missing_scraped:
-            print(f"Missing scrape:    {missing_scraped[:20]}{'...' if len(missing_scraped) > 20 else ''}")
+            print(f"Missing scrape:     {missing_scraped[:20]}{'...' if len(missing_scraped) > 20 else ''}")
         if missing_translated:
             print(f"Missing translate:  {missing_translated[:20]}{'...' if len(missing_translated) > 20 else ''}")
         return
 
     if args.step == "retry":
-        retry_gaps(args.start, args.end, args.delay)
+        retry_gaps(args.novel, args.url, args.start, args.end, args.delay, args.source_lang, args.target_lang)
         return
 
     if args.step in ("scrape", "all"):
         print("--- STEP 1: Scraping ---")
-        scrape_all(args.start, args.end, args.delay)
+        scrape_all(args.novel, args.url, args.start, args.end, args.delay)
 
     if args.step in ("translate", "all"):
-        print("\n--- STEP 2: Translating to pt-BR ---")
-        translate_all(args.start, args.end, args.delay)
+        print("\n--- STEP 2: Translating ---")
+        translate_all(args.novel, args.start, args.end, args.delay, args.source_lang, args.target_lang)
 
     if args.step in ("epub", "all"):
         print("\n--- STEP 3: Building EPUB ---")
-        build_epub(args.start, args.end)
+        build_epub(args.novel, args.start, args.end, args.title, args.author, args.target_lang)
 
 
 if __name__ == "__main__":
