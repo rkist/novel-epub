@@ -1,6 +1,6 @@
 # novel-epub
 
-Scrapes novels from novelhi.com, translates to any language via Google Translate (free, no API key needed), and exports to EPUB for Kindle.
+Scrapes novels from novelhi.com or centralnovel.com, translates to any language via Google Translate (free, no API key needed), and exports to EPUB for Kindle.
 
 ## Setup
 
@@ -27,7 +27,7 @@ This runs the full pipeline: scrape → translate → epub. Safe to interrupt an
 
 | Flag | Required | Default | Description |
 |---|---|---|---|
-| `--url` | yes | — | Base novel URL on novelhi.com |
+| `--url` | yes | — | Base novel URL on novelhi.com or centralnovel.com |
 | `--novel` | yes | — | Slug used as the data folder name |
 | `--title` | yes | — | EPUB title in the target language |
 | `--author` | no | `Unknown` | Author name for the EPUB |
@@ -35,7 +35,7 @@ This runs the full pipeline: scrape → translate → epub. Safe to interrupt an
 | `--end` | yes | — | Last chapter number |
 | `--delay` | no | `2.0` | Seconds between requests |
 | `--source-lang` | no | `en` | Source language code |
-| `--target-lang` | no | `pt` | Target language code |
+| `--target-lang` | no | `pt` | Target language code. If it matches `--source-lang`, chapters are copied without translation. |
 | `--step` | no | `all` | `scrape`, `translate`, `epub`, `status`, `retry`, or `all` |
 
 ## Steps
@@ -66,7 +66,7 @@ novels/
 
 ## How it works
 
-1. **Scrape** — fetches each chapter page and extracts text from `<sent>` tags inside `#showReading`
+1. **Scrape** — fetches each chapter page and extracts text from `<sent>` tags inside `#showReading` on NovelHi, or `.epcontent.entry-content` on CentralNovel
 2. **Translate** — sends paragraphs to Google Translate via `deep-translator`, chunking at 4500 chars to stay within the free-tier limit; retries up to 3 times with exponential backoff on failure; falls back to original text if all retries fail
 3. **Build EPUB** — assembles translated chapters into a single EPUB with a table of contents
 

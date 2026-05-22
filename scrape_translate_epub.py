@@ -15,10 +15,10 @@ Data is stored under novels/<novel>/. Safe to interrupt and resume.
 
 import argparse
 import json
-import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -33,6 +33,7 @@ HEADERS = {
 }
 
 MAX_TRANSLATE_CHARS = 4500
+CENTRALNOVEL_DOMAIN = "centralnovel.com"
 
 
 # --- Path helpers ---
@@ -68,8 +69,75 @@ def save_checkpoint(slug: str, data: dict):
 
 # --- Scraping ---
 
+def build_chapter_url(base_url: str, chapter_num: int) -> str:
+    parsed = urlparse(base_url.rstrip("/"))
+    if parsed.netloc.endswith(CENTRALNOVEL_DOMAIN):
+        path_parts = [part for part in parsed.path.split("/") if part]
+        slug = path_parts[-1] if path_parts else ""
+        if path_parts and path_parts[0] == "series":
+            slug = re.sub(r"-\d{8}$", "", slug)
+        else:
+            chapter_match = re.match(r"(.+)-capitulo-\d+$", slug)
+            if chapter_match:
+                slug = chapter_match.group(1)
+        return f"{parsed.scheme}://{parsed.netloc}/{slug}-capitulo-{chapter_num}/"
+
+    return f"{base_url.rstrip('/')}/{chapter_num}"
+
+
+def extract_novelhi_text(reading_div) -> str:
+    sentences = reading_div.find_all("sent")
+    if not sentences:
+        return reading_div.get_text(separator="\n", strip=True)
+
+    paragraphs = []
+    current_para = []
+    for sent in sentences:
+        current_para.append(sent.get_text(strip=True))
+        next_sib = sent.next_sibling
+        if next_sib and isinstance(next_sib, str) and next_sib.strip() == "":
+            next_sib = next_sib.next_sibling if hasattr(next_sib, "next_sibling") else None
+        if next_sib and getattr(next_sib, "name", None) == "br":
+            paragraphs.append(" ".join(current_para))
+            current_para = []
+    if current_para:
+        paragraphs.append(" ".join(current_para))
+    return "\n\n".join(paragraphs)
+
+
+def extract_centralnovel_text(content_div) -> str:
+    for tag in content_div.select("script, style, iframe, .epl-button, .code-block"):
+        tag.decompose()
+
+    paragraphs = [p.get_text(" ", strip=True) for p in content_div.find_all("p")]
+    paragraphs = [p for p in paragraphs if p]
+    if paragraphs:
+        return "\n\n".join(paragraphs)
+
+    return content_div.get_text(separator="\n", strip=True)
+
+
+def parse_chapter_html(chapter_num: int, html: str) -> dict | None:
+    soup = BeautifulSoup(html, "lxml")
+
+    title_el = soup.select_one("h1.readTitle, .read-title h1, h1.entry-title, h1")
+    title = title_el.get_text(" ", strip=True) if title_el else f"Chapter {chapter_num}"
+
+    reading_div = soup.find("div", id="showReading")
+    if reading_div:
+        text = extract_novelhi_text(reading_div)
+    else:
+        content_div = soup.select_one(".epcontent.entry-content, .epcontent, .entry-content")
+        if not content_div:
+            print(f"  [!] No content found for chapter {chapter_num}")
+            return None
+        text = extract_centralnovel_text(content_div)
+
+    return {"chapter_num": chapter_num, "title": title, "text": re.sub(r"\n{3,}", "\n\n", text).strip()}
+
+
 def scrape_chapter(chapter_num: int, base_url: str, session: requests.Session, max_retries: int = 3) -> dict | None:
-    url = f"{base_url}/{chapter_num}"
+    url = build_chapter_url(base_url, chapter_num)
     for attempt in range(max_retries):
         try:
             resp = session.get(url, headers=HEADERS, timeout=30)
@@ -86,35 +154,7 @@ def scrape_chapter(chapter_num: int, base_url: str, session: requests.Session, m
             print(f" [!] Failed after {max_retries} attempts: {e}")
             return None
 
-    soup = BeautifulSoup(resp.text, "lxml")
-
-    title_el = soup.select_one("h1.readTitle, .read-title h1, h1")
-    title = title_el.get_text(strip=True) if title_el else f"Chapter {chapter_num}"
-
-    reading_div = soup.find("div", id="showReading")
-    if not reading_div:
-        print(f"  [!] No content found for chapter {chapter_num}")
-        return None
-
-    sentences = reading_div.find_all("sent")
-    if not sentences:
-        text = reading_div.get_text(separator="\n", strip=True)
-    else:
-        paragraphs = []
-        current_para = []
-        for sent in sentences:
-            current_para.append(sent.get_text(strip=True))
-            next_sib = sent.next_sibling
-            if next_sib and isinstance(next_sib, str) and next_sib.strip() == "":
-                next_sib = next_sib.next_sibling if hasattr(next_sib, "next_sibling") else None
-            if next_sib and getattr(next_sib, "name", None) == "br":
-                paragraphs.append(" ".join(current_para))
-                current_para = []
-        if current_para:
-            paragraphs.append(" ".join(current_para))
-        text = "\n\n".join(paragraphs)
-
-    return {"chapter_num": chapter_num, "title": title, "text": re.sub(r"\n{3,}", "\n\n", text).strip()}
+    return parse_chapter_html(chapter_num, resp.text)
 
 
 # --- Translation ---
@@ -164,6 +204,15 @@ def translate_title(title: str, translator: GoogleTranslator) -> str:
         return result if result else title
     except Exception:
         return title
+
+
+def translate_chapter_data(data: dict, translator: GoogleTranslator | None) -> dict:
+    return {
+        "chapter_num": data["chapter_num"],
+        "title_original": data["title"],
+        "title": translate_title(data["title"], translator) if translator else data["title"],
+        "text": translate_text(data["text"], translator) if translator else data["text"],
+    }
 
 
 # --- Progress display ---
@@ -245,7 +294,7 @@ def translate_all(slug: str, start: int, end: int, delay: float, source_lang: st
     if resume_from > start:
         print(f"Resuming translation from chapter {resume_from}")
 
-    translator = GoogleTranslator(source=source_lang, target=target_lang)
+    translator = None if source_lang == target_lang else GoogleTranslator(source=source_lang, target=target_lang)
     step_start = time.time()
     done_count = 0
 
@@ -268,18 +317,14 @@ def translate_all(slug: str, start: int, end: int, delay: float, source_lang: st
         data = json.loads(source_file.read_text())
         print(f"\r{progress_line(done_count, total, step_start, 'Translating')} | ch.{ch}...", end="", flush=True)
 
-        translated_data = {
-            "chapter_num": data["chapter_num"],
-            "title_original": data["title"],
-            "title": translate_title(data["title"], translator),
-            "text": translate_text(data["text"], translator),
-        }
+        translated_data = translate_chapter_data(data, translator)
 
         dest_file.write_text(json.dumps(translated_data, ensure_ascii=False, indent=2))
         checkpoint["last_translated"] = ch
         save_checkpoint(slug, checkpoint)
         print(f"\r{progress_line(done_count, total, step_start, 'Translating')} | ch.{ch} OK")
-        time.sleep(delay)
+        if translator:
+            time.sleep(delay)
 
     print(f"\nTranslation complete. Last chapter: {checkpoint['last_translated']} ({format_eta(time.time() - step_start)} elapsed)")
 
@@ -372,19 +417,14 @@ def retry_gaps(slug: str, base_url: str, start: int, end: int, delay: float, sou
         preview = missing_translated[:10]
         suffix = "..." if len(missing_translated) > 10 else ""
         print(f"Found {len(missing_translated)} chapters not translated: {preview}{suffix}")
-        translator = GoogleTranslator(source=source_lang, target=target_lang)
+        translator = None if source_lang == target_lang else GoogleTranslator(source=source_lang, target=target_lang)
         for i, ch in enumerate(missing_translated):
             src = chapters_dir(slug) / f"{ch:04d}.json"
             if not src.exists():
                 continue
             data = json.loads(src.read_text())
             print(f"  Retrying translate {i+1}/{len(missing_translated)} — ch.{ch}...", end=" ", flush=True)
-            translated_data = {
-                "chapter_num": data["chapter_num"],
-                "title_original": data["title"],
-                "title": translate_title(data["title"], translator),
-                "text": translate_text(data["text"], translator),
-            }
+            translated_data = translate_chapter_data(data, translator)
             (translated_dir(slug) / f"{ch:04d}.json").write_text(json.dumps(translated_data, ensure_ascii=False, indent=2))
             print("OK")
             time.sleep(delay)
@@ -398,7 +438,7 @@ def retry_gaps(slug: str, base_url: str, start: int, end: int, delay: float, sou
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Scrape a novelhi.com novel, translate it, and export to EPUB.",
+        description="Scrape a novelhi.com or centralnovel.com novel, translate it, and export to EPUB.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--url",         required=True,  help="Base novel URL, e.g. https://novelhi.com/novel/fantasy/the-legendary-mechanic")
